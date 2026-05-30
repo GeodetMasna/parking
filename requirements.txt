@@ -1,0 +1,5 @@
+Flask>=3.0
+flask-cors>=4.0
+ezdxf>=1.1
+shapely>=2.0
+gunicorn>=21.2

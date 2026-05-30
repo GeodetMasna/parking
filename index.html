@@ -1,0 +1,257 @@
+<!DOCTYPE html>
+<html lang="cs">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Generátor parkovacích stání · ČSN 73 6056</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Spline+Sans+Mono:wght@400;500;600&family=Hanken+Grotesk:wght@400;500;700&display=swap" rel="stylesheet">
+<style>
+  :root{
+    --bg:#0b1220; --panel:#101a2e; --panel-2:#0d1626;
+    --line:#1f3050; --line-soft:#172541;
+    --ink:#e8eefc; --muted:#7d8db3; --muted-2:#5b6b91;
+    --accent:#3ddc97; --accent-dim:#1f8d63; --danger:#ff6b6b;
+    --grid:rgba(61,220,151,.05);
+    --mono:'Spline Sans Mono',ui-monospace,monospace;
+    --sans:'Hanken Grotesk',system-ui,sans-serif;
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{
+    font-family:var(--sans); color:var(--ink); min-height:100vh;
+    background:var(--bg);
+    background-image:
+      linear-gradient(var(--grid) 1px,transparent 1px),
+      linear-gradient(90deg,var(--grid) 1px,transparent 1px);
+    background-size:28px 28px;
+    display:flex; justify-content:center; padding:48px 20px;
+  }
+  .wrap{width:100%;max-width:560px}
+  header{margin-bottom:28px}
+  .tag{
+    font-family:var(--mono); font-size:11px; letter-spacing:.22em;
+    text-transform:uppercase; color:var(--accent); display:inline-block;
+    border:1px solid var(--accent-dim); border-radius:3px; padding:4px 9px;
+  }
+  h1{font-size:30px; font-weight:700; line-height:1.1; margin:16px 0 6px; letter-spacing:-.02em}
+  .sub{color:var(--muted); font-size:14px; line-height:1.5}
+  .sub code{font-family:var(--mono); color:var(--accent); font-size:12.5px}
+
+  form{
+    background:linear-gradient(180deg,var(--panel),var(--panel-2));
+    border:1px solid var(--line); border-radius:14px; padding:26px;
+    box-shadow:0 24px 60px -30px rgba(0,0,0,.8);
+  }
+  label{display:block; font-family:var(--mono); font-size:11px;
+    letter-spacing:.14em; text-transform:uppercase; color:var(--muted);
+    margin-bottom:8px}
+  .lbl-note{color:var(--muted-2); text-transform:none; letter-spacing:0;
+    font-size:10.5px}
+
+  /* Drop zóna */
+  .drop{
+    border:1.5px dashed var(--line); border-radius:10px; padding:26px 18px;
+    text-align:center; cursor:pointer; transition:.18s; background:var(--panel-2);
+  }
+  .drop:hover,.drop.over{border-color:var(--accent); background:rgba(61,220,151,.04)}
+  .drop .icon{font-size:26px}
+  .drop .main{margin-top:8px; font-weight:500}
+  .drop .hint{color:var(--muted-2); font-size:12.5px; margin-top:4px}
+  .drop.has-file{border-style:solid; border-color:var(--accent-dim)}
+  .drop.has-file .main{color:var(--accent); font-family:var(--mono); font-size:14px}
+  input[type=file]{display:none}
+
+  .field{margin-top:22px}
+  .grid2{display:grid; grid-template-columns:1fr 1fr; gap:16px}
+  select,input[type=text],input[type=number]{
+    width:100%; background:var(--bg); border:1px solid var(--line);
+    border-radius:8px; padding:12px 13px; color:var(--ink);
+    font-family:var(--mono); font-size:14px; transition:.15s;
+  }
+  select:focus,input:focus{outline:none; border-color:var(--accent);
+    box-shadow:0 0 0 3px rgba(61,220,151,.12)}
+  .unit{position:relative}
+  .unit .u{position:absolute; right:12px; top:50%; transform:translateY(-50%);
+    color:var(--muted-2); font-family:var(--mono); font-size:12px; pointer-events:none}
+
+  button{
+    width:100%; margin-top:26px; padding:15px; border:none; border-radius:9px;
+    background:var(--accent); color:#06281a; font-family:var(--mono);
+    font-weight:600; font-size:14px; letter-spacing:.05em; text-transform:uppercase;
+    cursor:pointer; transition:.15s;
+  }
+  button:hover:not(:disabled){background:#52e8a8; transform:translateY(-1px)}
+  button:disabled{opacity:.5; cursor:not-allowed; transform:none}
+
+  .status{margin-top:18px; font-family:var(--mono); font-size:13px;
+    min-height:20px; line-height:1.5}
+  .status.ok{color:var(--accent)}
+  .status.err{color:var(--danger)}
+  .status.work{color:var(--muted)}
+  .dot{display:inline-block;width:7px;height:7px;border-radius:50%;
+    background:currentColor;margin-right:8px;animation:pulse 1s infinite}
+  @keyframes pulse{0%,100%{opacity:.3}50%{opacity:1}}
+
+  footer{margin-top:22px; color:var(--muted-2); font-size:12px;
+    font-family:var(--mono); line-height:1.7}
+  footer b{color:var(--muted)}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <span class="tag">ČSN 73 6056</span>
+    <h1>Generátor parkovacích stání</h1>
+    <p class="sub">Nahraj DXF s uzavřeným obrysem plochy. Backend vygeneruje
+      stání dovnitř a ořeže přečnívající. Endpoint: <code>POST /generate</code></p>
+  </header>
+
+  <form id="f" autocomplete="off">
+    <label>Vstupní výkres (DXF)</label>
+    <div class="drop" id="drop">
+      <div class="icon">⬡</div>
+      <div class="main" id="dropMain">Přetáhni sem .dxf nebo klikni</div>
+      <div class="hint">Vybere se uzavřená křivka s největší plochou</div>
+    </div>
+    <input type="file" id="file" accept=".dxf">
+
+    <div class="field">
+      <label>Typ řazení · ČSN 73 6056 (osobní vozidla)</label>
+      <select id="type">
+        <option value="kolme"   data-w="2.50" data-l="5.00" data-a="6.00" data-ang="90">Kolmé · 90° — 2,50 / 5,00 / 6,00</option>
+        <option value="sikme75" data-w="2.60" data-l="5.30" data-a="5.00" data-ang="75">Šikmé · 75° — 2,60 / 5,30 / 5,00</option>
+        <option value="sikme60" data-w="2.90" data-l="5.20" data-a="3.50" data-ang="60">Šikmé · 60° — 2,90 / 5,20 / 3,50</option>
+        <option value="sikme45" data-w="3.55" data-l="4.80" data-a="3.00" data-ang="45">Šikmé · 45° — 3,55 / 4,80 / 3,00</option>
+        <option value="podelne" data-w="2.00" data-l="5.75" data-a="3.50" data-ang="0">Podélné · 0° — 2,00 / 5,75 / 3,50</option>
+      </select>
+    </div>
+
+    <div class="field grid2">
+      <div>
+        <label>Šířka stání <span class="lbl-note">podél komunikace</span></label>
+        <div class="unit"><input type="number" id="width" step="0.05" value="2.50"><span class="u">m</span></div>
+      </div>
+      <div>
+        <label>Délka stání <span class="lbl-note">kolmá hloubka</span></label>
+        <div class="unit"><input type="number" id="length" step="0.05" value="5.00"><span class="u">m</span></div>
+      </div>
+    </div>
+
+    <div class="field grid2">
+      <div>
+        <label>Šířka komunikace</label>
+        <div class="unit"><input type="number" id="aisle" step="0.1" value="6.00"><span class="u">m</span></div>
+      </div>
+      <div>
+        <label>Úhel řazení</label>
+        <div class="unit"><input type="number" id="angle" step="1" value="90"><span class="u">°</span></div>
+      </div>
+    </div>
+
+    <div class="field">
+      <label>Vrstva obrysu — volitelné</label>
+      <input type="text" id="layer" placeholder="prázdné = největší křivka">
+    </div>
+
+    <button type="submit" id="btn">Vygenerovat stání</button>
+    <div class="status" id="status"></div>
+  </form>
+
+  <footer>
+    <b>Backend:</b> <span id="be"></span><br>
+    <b>ČSN 73 6056:</b> <i>šířka</i> = rozteč podél komunikace, <i>délka</i> = kolmá hloubka řady.<br>
+    <b>Pozn.:</b> Rozměry v jednotkách výkresu (ČSN = metry; je-li výkres v mm, zadej v mm).
+  </footer>
+</div>
+
+<script>
+// ===========================================================================
+//  Po nasazení na Railway sem vlož veřejnou URL, např.
+//  "https://muj-projekt.up.railway.app"
+// ===========================================================================
+const BACKEND_URL = "http://127.0.0.1:5000"; // Po nahrání na Railway změním na URL od Railway
+
+const $ = (id) => document.getElementById(id);
+$("be").textContent = BACKEND_URL;
+
+// --- Drag & drop + výběr souboru ------------------------------------------
+const drop = $("drop"), fileInput = $("file");
+drop.addEventListener("click", () => fileInput.click());
+["dragenter","dragover"].forEach(e =>
+  drop.addEventListener(e, ev => { ev.preventDefault(); drop.classList.add("over"); }));
+["dragleave","drop"].forEach(e =>
+  drop.addEventListener(e, ev => { ev.preventDefault(); drop.classList.remove("over"); }));
+drop.addEventListener("drop", ev => {
+  if (ev.dataTransfer.files.length) { fileInput.files = ev.dataTransfer.files; showFile(); }
+});
+fileInput.addEventListener("change", showFile);
+function showFile(){
+  const f = fileInput.files[0];
+  if (f){ drop.classList.add("has-file"); $("dropMain").textContent = "✓ " + f.name; }
+}
+
+// --- Předvyplnění rozměrů podle typu stání --------------------------------
+$("type").addEventListener("change", e => {
+  const o = e.target.selectedOptions[0];
+  $("width").value  = o.dataset.w;
+  $("length").value = o.dataset.l;
+  $("aisle").value  = o.dataset.a;
+  $("angle").value  = o.dataset.ang;
+});
+
+// --- Odeslání na backend a stažení výsledku --------------------------------
+$("f").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const status = $("status"), btn = $("btn");
+  const file = fileInput.files[0];
+  if (!file){ setStatus("err", "Nejprve vyber soubor DXF."); return; }
+
+  const fd = new FormData();
+  fd.append("file",   file);
+  fd.append("type",   $("type").value);
+  fd.append("width",  $("width").value);
+  fd.append("length", $("length").value);
+  fd.append("aisle",  $("aisle").value);
+  fd.append("angle",  $("angle").value);
+  if ($("layer").value.trim()) fd.append("layer", $("layer").value.trim());
+
+  btn.disabled = true;
+  setStatus("work", '<span class="dot"></span>Generuji stání…');
+
+  try {
+    const res = await fetch(BACKEND_URL + "/generate", { method:"POST", body:fd });
+
+    if (!res.ok) {
+      let msg = "Chyba serveru (" + res.status + ")";
+      try { const j = await res.json(); if (j.error) msg = j.error; } catch(_){}
+      setStatus("err", "✕ " + msg);
+      return;
+    }
+
+    const count = res.headers.get("X-Stall-Count");
+    const blob  = await res.blob();
+    const url   = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = file.name.replace(/\.dxf$/i, "") + "_stani.dxf";
+    document.body.appendChild(a); a.click(); a.remove();
+    URL.revokeObjectURL(url);
+
+    setStatus("ok", "✓ Hotovo — vygenerováno " + (count ?? "?") + " stání. Soubor se stahuje.");
+  } catch (err) {
+    setStatus("err", "✕ Nelze se spojit s backendem. Běží server na " + BACKEND_URL + "?");
+    console.error(err);
+  } finally {
+    btn.disabled = false;
+  }
+});
+
+function setStatus(cls, html){
+  const s = $("status");
+  s.className = "status " + cls;
+  s.innerHTML = html;
+}
+</script>
+</body>
+</html>
