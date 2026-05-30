@@ -18,6 +18,7 @@ import io
 import math
 import os
 import tempfile
+from collections import Counter
 
 import ezdxf
 from ezdxf import bbox as ezbbox
@@ -58,52 +59,109 @@ CSN_PRESETS = {
 # ---------------------------------------------------------------------------
 #  Načtení obrysu z DXF
 # ---------------------------------------------------------------------------
-def _polyline_points(entity):
-    """Vrátí seznam (x, y) bodů z LWPOLYLINE / POLYLINE, pokud je uzavřená."""
-    dxftype = entity.dxftype()
-    if dxftype == "LWPOLYLINE":
-        if not entity.closed:
-            return None
-        return [(p[0], p[1]) for p in entity.get_points("xy")]
-    if dxftype == "POLYLINE":
-        if not entity.is_closed:
-            return None
-        return [(v.dxf.location.x, v.dxf.location.y) for v in entity.vertices]
+CLOSE_TOL_REL = 1e-3  # relativní tolerance pro geometricky uzavřenou křivku
+
+
+def _points_from_entity(e):
+    """
+    Vrátí (body[(x,y)], je_uzavřená) nebo None.
+    Podporuje LWPOLYLINE, POLYLINE, CIRCLE, ELLIPSE a uzavřený SPLINE.
+    """
+    t = e.dxftype()
+    try:
+        if t == "LWPOLYLINE":
+            return [(p[0], p[1]) for p in e.get_points("xy")], bool(e.closed)
+        if t == "POLYLINE":
+            return [(v.dxf.location.x, v.dxf.location.y) for v in e.vertices], bool(e.is_closed)
+        if t == "CIRCLE":
+            c, r = e.dxf.center, e.dxf.radius
+            n = 72
+            return [(c.x + r * math.cos(2 * math.pi * i / n),
+                     c.y + r * math.sin(2 * math.pi * i / n)) for i in range(n)], True
+        if t == "ELLIPSE":
+            return [(p.x, p.y) for p in e.flattening(0.05)], True
+        if t == "SPLINE" and e.closed:
+            return [(p.x, p.y) for p in e.flattening(0.05)], True
+    except Exception:
+        return None
     return None
+
+
+def _iter_entities(doc):
+    """Projde modelspace a rozbalí i obsah vložených bloků (INSERT)."""
+    for e in doc.modelspace():
+        if e.dxftype() == "INSERT":
+            try:
+                yield from e.virtual_entities()
+            except Exception:
+                continue
+        else:
+            yield e
+
+
+def _is_geom_closed(pts):
+    """Křivka je uzavřená, pokud první a poslední bod splývají (rel. tolerance)."""
+    if len(pts) < 3:
+        return False
+    xs = [p[0] for p in pts]
+    ys = [p[1] for p in pts]
+    diag = math.hypot(max(xs) - min(xs), max(ys) - min(ys)) or 1.0
+    return math.dist(pts[0], pts[-1]) <= diag * CLOSE_TOL_REL
 
 
 def extract_boundary(doc, layer=None):
     """
-    Vybere zpracovávanou uzavřenou křivku.
-      - Pokud je zadán `layer`, hledá pouze na této vrstvě.
-      - Jinak vybere uzavřenou křivku s největší plochou.
-    Vrací (shapely.Polygon, počet_kandidátů).
+    Vybere zpracovávaný obrys (uzavřenou křivku s největší plochou, příp. na dané
+    vrstvě). Akceptuje polylinie uzavřené příznakem i geometricky, CIRCLE, ELLIPSE
+    a uzavřený SPLINE; prohledá i obsah bloků. Pokud žádná uzavřená křivka není,
+    zkusí uzavřít největší otevřenou polylinii (s upozorněním).
+    Vrací (shapely.Polygon | None, diagnostics: dict).
     """
-    msp = doc.modelspace()
-    candidates = []
-    for e in msp:
-        if e.dxftype() not in ("LWPOLYLINE", "POLYLINE"):
+    types = Counter()
+    layers = set()
+    closed_polys, open_polys = [], []
+
+    for e in _iter_entities(doc):
+        types[e.dxftype()] += 1
+        ent_layer = getattr(e.dxf, "layer", None)
+        if ent_layer:
+            layers.add(ent_layer)
+        if layer and ent_layer != layer:
             continue
-        if layer and e.dxf.layer != layer:
+
+        res = _points_from_entity(e)
+        if not res:
             continue
-        pts = _polyline_points(e)
-        if not pts or len(pts) < 3:
+        pts, is_closed = res
+        if len(pts) < 3:
             continue
         try:
             poly = Polygon(pts)
+            if not poly.is_valid:
+                poly = poly.buffer(0)
         except Exception:
             continue
-        if not poly.is_valid:
-            poly = poly.buffer(0)
         if poly.is_empty or poly.area <= 0:
             continue
-        candidates.append(poly)
 
-    if not candidates:
-        return None, 0
-    # největší plocha = obrys parkoviště
-    candidates.sort(key=lambda p: p.area, reverse=True)
-    return candidates[0], len(candidates)
+        (closed_polys if (is_closed or _is_geom_closed(pts)) else open_polys).append(poly)
+
+    diag = {
+        "types": dict(types),
+        "layers": sorted(layers),
+        "closed": len(closed_polys),
+        "open": len(open_polys),
+        "auto_closed": False,
+    }
+
+    if closed_polys:
+        closed_polys.sort(key=lambda p: p.area, reverse=True)
+        return closed_polys[0], diag
+    if open_polys:  # nouzové uzavření největší otevřené polylinie
+        open_polys.sort(key=lambda p: p.area, reverse=True)
+        diag["auto_closed"] = True
+        return open_polys[0], diag
+    return None, diag
 
 
 # ---------------------------------------------------------------------------
@@ -231,6 +289,29 @@ def presets():
     return jsonify(CSN_PRESETS)
 
 
+@app.post("/inspect")
+def inspect():
+    """Diagnostika DXF: typy entit, vrstvy, počet uzavřených/otevřených křivek."""
+    if "file" not in request.files or not request.files["file"].filename:
+        return jsonify({"error": "Chybí soubor DXF (pole 'file')."}), 400
+    upload = request.files["file"]
+    tmp = tempfile.NamedTemporaryFile(suffix=".dxf", delete=False)
+    try:
+        upload.save(tmp.name)
+        tmp.close()
+        try:
+            doc = ezdxf.readfile(tmp.name)
+        except (IOError, ezdxf.DXFStructureError) as exc:
+            return jsonify({"error": f"Neplatný DXF: {exc}"}), 400
+        _, diag = extract_boundary(doc, request.form.get("layer") or None)
+        return jsonify(diag)
+    finally:
+        try:
+            os.unlink(tmp.name)
+        except OSError:
+            pass
+
+
 @app.post("/generate")
 def generate():
     if "file" not in request.files:
@@ -275,11 +356,18 @@ def generate():
         except (IOError, ezdxf.DXFStructureError) as exc:
             return jsonify({"error": f"Neplatný DXF: {exc}"}), 400
 
-        boundary, n = extract_boundary(doc, layer)
+        boundary, diag = extract_boundary(doc, layer)
         if boundary is None:
+            found = ", ".join(f"{k}×{v}" for k, v in sorted(diag["types"].items())) or "nic"
             return jsonify({
-                "error": "Nenalezena žádná uzavřená křivka (LWPOLYLINE/POLYLINE)."
-                         + (f" na vrstvě '{layer}'." if layer else "")
+                "error": "Nenalezena žádná uzavřená plocha. Obrys musí být uzavřená "
+                         "polylinie (LWPOLYLINE/POLYLINE), kruh, elipsa nebo uzavřený "
+                         "splajn."
+                         + (f" Na vrstvě '{layer}'." if layer else "")
+                         + f" V souboru jsem našel: {found}. "
+                         "Tip: v CADu obrys spoj příkazem PEDIT/JOIN a zavři (Closed), "
+                         "nebo zadej vrstvu obrysu.",
+                "diagnostics": diag,
             }), 422
 
         stalls = generate_stalls(boundary, pitch, depth, aisle, angle, parallel)
@@ -300,7 +388,9 @@ def generate():
         )
         # Počet stání předáme v hlavičce (frontend ji může přečíst)
         resp.headers["X-Stall-Count"] = str(len(stalls))
-        resp.headers["Access-Control-Expose-Headers"] = "X-Stall-Count"
+        if diag.get("auto_closed"):
+            resp.headers["X-Warning"] = "boundary-auto-closed"
+        resp.headers["Access-Control-Expose-Headers"] = "X-Stall-Count, X-Warning"
         return resp
     finally:
         try:
