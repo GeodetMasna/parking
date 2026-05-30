@@ -25,7 +25,8 @@ from ezdxf import bbox as ezbbox
 from flask import Flask, request, send_file, jsonify
 from flask_cors import CORS
 from shapely.affinity import rotate as shp_rotate
-from shapely.geometry import Polygon
+from shapely.geometry import Polygon, Point
+from shapely.ops import unary_union
 from shapely.prepared import prep
 
 app = Flask(__name__)
@@ -35,9 +36,12 @@ app = Flask(__name__)
 # hlavičku "Origin: null". Wildcard "*" tuto situaci pokrývá i pro null origin.
 CORS(app, resources={r"/*": {"origins": "*"}})
 
-# Vrstva, na kterou se kreslí vygenerovaná stání
-STALL_LAYER = "PARKING_STANI"
-STALL_LAYER_COLOR = 3  # zelená (ACI)
+# Vrstvy, na které se kreslí vygenerovaná stání
+STALL_LAYER = "PARKING_STANI"            # jednotný typ
+STALL_LAYER_COLOR = 3                     # zelená (ACI)
+KOLME_LAYER = "PARKING_KOLME"             # kombi: kolmé jádro
+PODELNE_LAYER = "PARKING_PODELNE"         # kombi: podélné okraje
+ALL_STALL_LAYERS = [STALL_LAYER, KOLME_LAYER, PODELNE_LAYER]
 
 # ---------------------------------------------------------------------------
 #  ČSN 73 6056 (rev. 2011) – tabulkové rozměry pro osobní vozidla [m]
@@ -122,8 +126,10 @@ def extract_boundary(doc, layer=None):
     closed_polys, open_polys = [], []
 
     for e in _iter_entities(doc):
-        types[e.dxftype()] += 1
         ent_layer = getattr(e.dxf, "layer", None)
+        if ent_layer in ALL_STALL_LAYERS:
+            continue  # přeskoč dříve vygenerovaná stání
+        types[e.dxftype()] += 1
         if ent_layer:
             layers.add(ent_layer)
         if layer and ent_layer != layer:
@@ -167,108 +173,175 @@ def extract_boundary(doc, layer=None):
 # ---------------------------------------------------------------------------
 #  Generování stání
 # ---------------------------------------------------------------------------
-def _row_starts(y_min, y_max, row_depth, aisle):
+def _max_rows(depth_avail, d, a):
+    """Max. počet řad v hloubce; uličky = ceil(n/2) (každá řada má přístup k uličce)."""
+    n = 0
+    while (n + 1) * d + math.ceil((n + 1) / 2) * a <= depth_avail + 1e-9:
+        n += 1
+    return n
+
+
+def _row_starts(y_min, y_max, d, a):
     """
-    Pozice začátků řad ve směru hloubky.
-    Vzor:  řada – ulička – řada – řada(zády k sobě) – ulička – ...
-    To odpovídá běžnému dvoupruhovému modulu parkoviště.
+    Optimální dvoupruhové uspořádání řad dle ČSN: řada |ulička| řada–řada |ulička| …
+    (mezery mezi řadami: a, 0, a, 0, …, a; krajní i poslední řada má přístup k uličce).
+    Maximalizuje počet řad a blok vycentruje v dostupné hloubce.
     """
-    starts = []
-    y = y_min
-    gap_is_aisle = True
-    eps = 1e-9
-    while y + row_depth <= y_max + eps:
+    D = y_max - y_min
+    n = _max_rows(D, d, a)
+    if n <= 0:
+        return []
+    gaps = [a if i % 2 == 0 else 0.0 for i in range(n - 1)]
+    if gaps:
+        gaps[-1] = a  # poslední řada musí mít uličku (přístup)
+    starts, y = [], 0.0
+    for i in range(n):
         starts.append(y)
-        y += row_depth + (aisle if gap_is_aisle else 0.0)
-        gap_is_aisle = not gap_is_aisle
-    return starts
+        if i < n - 1:
+            y += d + gaps[i]
+    used = starts[-1] + d
+    shift = y_min + (D - used) / 2.0
+    return [s + shift for s in starts]
 
 
-def _stall_polygons_in_frame(work_poly, pitch, depth, aisle, angle_deg, parallel):
-    """
-    Vygeneruje stání v pracovním (osově zarovnaném) systému dle konvence ČSN 73 6056:
-        pitch = šířka stání měřená PODÉL komunikace (rozteč mezi stáními),
-        depth = délka stání = KOLMÁ hloubka řady (od hrany komunikace k obrubníku),
-        angle = úhel řazení (90° kolmé; 45/60/75° šikmé; podélné -> obdélník).
-
-    Šikmé stání je rovnoběžník se svislou hloubkou `depth` a vodorovným posunutím
-    horní hrany run = depth / tan(angle). Kolmá světlá šířka stání pak vychází
-    pitch · sin(angle) ≈ 2,5 m, což odpovídá normě.
-    Vrací seznam shapely.Polygon (kandidáti, ještě nefiltrováno).
-    """
+def _layout(work_poly, prepared, pitch, depth, aisle, angle_deg, parallel,
+            row_shift, col_shift):
+    """Vygeneruje a hned ořeže stání pro jedno konkrétní natočení/posun rastru."""
     minx, miny, maxx, maxy = work_poly.bounds
-    stalls = []
-
     if parallel:
-        run = 0.0  # podélné = obdélník (vůz rovnoběžně s komunikací)
+        run = 0.0
     else:
         theta = math.radians(angle_deg)
         run = 0.0 if abs(theta - math.pi / 2) < 1e-6 else depth / math.tan(theta)
 
-    for y0 in _row_starts(miny, maxy, depth, aisle):
-        x = minx
-        # poslední stání v řadě se nesmí dostat za pravý okraj rastru
+    kept = []
+    for y0 in _row_starts(miny + row_shift, maxy, depth, aisle):
+        x = minx + col_shift
         while x + pitch + max(run, 0.0) <= maxx + 1e-9:
-            stalls.append(Polygon([
-                (x, y0),
-                (x + pitch, y0),
-                (x + pitch + run, y0 + depth),
-                (x + run, y0 + depth),
-            ]))
+            poly = Polygon([
+                (x, y0), (x + pitch, y0),
+                (x + pitch + run, y0 + depth), (x + run, y0 + depth),
+            ])
+            if prepared.contains(poly):
+                kept.append(poly)
             x += pitch
-    return stalls
+    return kept
 
 
 def generate_stalls(boundary, pitch, depth, aisle, angle_deg, parallel):
     """
-    Hlavní generátor.
-      1. Zarovná generační rastr s nejdelší hranou obrysu (lepší vyplnění).
-      2. Vygeneruje kandidáty stání.
-      3. Ponechá pouze ta, která leží zcela uvnitř obrysu.
+    Optimalizační generátor – maximalizuje počet stání:
+      1. Vyzkouší více NATOČENÍ rastru (hlavní směry obrysu + hrubý sweep po 15°).
+      2. Pro každé natočení vyzkouší několik FÁZOVÝCH POSUNŮ řad i sloupců.
+      3. Ponechá jen stání ležící celá uvnitř obrysu a vybere nejlepší variantu.
     Vrací seznam stání jako seznamy (x, y) bodů ve světových souřadnicích.
     """
     centroid = boundary.centroid
 
-    # Orientace nejmenšího opsaného obdélníku => natočení rastru
+    # Kandidátní natočení: hlavní směry nejmenšího opsaného obdélníku + sweep
     mrr = boundary.minimum_rotated_rectangle
-    coords = list(mrr.exterior.coords)
-    edges = [(coords[i], coords[i + 1]) for i in range(len(coords) - 1)]
+    cc = list(mrr.exterior.coords)
+    edges = [(cc[i], cc[i + 1]) for i in range(len(cc) - 1)]
     longest = max(edges, key=lambda e: math.dist(e[0], e[1]))
-    phi = math.degrees(math.atan2(longest[1][1] - longest[0][1],
-                                  longest[1][0] - longest[0][0]))
+    phi0 = math.degrees(math.atan2(longest[1][1] - longest[0][1],
+                                   longest[1][0] - longest[0][0]))
+    orients = sorted({round((phi0 + 15 * k) % 180, 3) for k in range(12)}
+                     | {round((phi0 + 90) % 180, 3)})
 
-    # Pracovní soustava: obrys natočíme o -phi kolem těžiště
-    work_poly = shp_rotate(boundary, -phi, origin=centroid)
-    candidates = _stall_polygons_in_frame(
-        work_poly, pitch, depth, aisle, angle_deg, parallel
-    )
+    tol = min(pitch, depth) * 1e-3
+    period = depth + aisle
+    row_shifts = [-period / 2 + period * f for f in (0.0, 0.25, 0.5, 0.75)]
+    col_shifts = [pitch * f for f in (0.0, 0.34, 0.67)]
 
-    # Filtr přečnívajících – stání musí ležet celé uvnitř (s malou tolerancí)
-    test_poly = work_poly.buffer(-min(pitch, depth) * 1e-3)
-    if test_poly.is_empty:
-        test_poly = work_poly
-    prepared = prep(test_poly)
+    best_kept, best_ori = [], phi0
+    for ori in orients:
+        work = shp_rotate(boundary, -ori, origin=centroid)
+        shrunk = work.buffer(-tol)
+        prepared = prep(shrunk if not shrunk.is_empty else work)
+        for rs in row_shifts:
+            for cs in col_shifts:
+                kept = _layout(work, prepared, pitch, depth, aisle,
+                               angle_deg, parallel, rs, cs)
+                if len(kept) > len(best_kept):
+                    best_kept, best_ori = kept, ori
 
-    kept = []
-    for stall in candidates:
-        if prepared.contains(stall):
-            world = shp_rotate(stall, phi, origin=centroid)
-            kept.append(list(world.exterior.coords)[:-1])
-    return kept
+    out = []
+    for poly in best_kept:
+        world = shp_rotate(poly, best_ori, origin=centroid)
+        out.append(list(world.exterior.coords)[:-1])
+    return out
+
+
+def parallel_along_edges(boundary, occupied, length, depth, clear=0.15, setback=0.03):
+    """
+    KOMBI: doplní podélná stání podél HRAN obrysu (frontáží) do míst, kde už
+    není kolmé jádro. Stání leží dlouhou stranou na hraně (mírně odsazeno
+    dovnitř), nepřesahují obrys a nekolidují s `occupied` (kolmé pole + již
+    osazená podélná). Vnitřní ulička se tím nezaplňuje – ta není hranou obrysu.
+    Pozn.: dojezd k těmto stáním je nutné ručně ověřit.
+    Vrací seznam stání jako seznamy (x, y) bodů.
+    """
+    prepared = prep(boundary)
+    coords = list(boundary.exterior.coords)
+    out = []
+    for i in range(len(coords) - 1):
+        ax, ay = coords[i]
+        bx, by = coords[i + 1]
+        ex, ey = bx - ax, by - ay
+        elen = math.hypot(ex, ey)
+        if elen < length:
+            continue
+        ux, uy = ex / elen, ey / elen
+        # vnitřní normála hrany
+        nrm = None
+        for nx, ny in ((-uy, ux), (uy, -ux)):
+            if boundary.contains(Point(ax + ux * elen / 2 + nx * 0.5,
+                                       ay + uy * elen / 2 + ny * 0.5)):
+                nrm = (nx, ny)
+                break
+        if nrm is None:
+            continue
+        nx, ny = nrm
+        ox, oy = ax + nx * setback, ay + ny * setback  # odsazení od hrany
+        k = 0
+        while (k + 1) * length <= elen + 1e-9:
+            x0 = ox + ux * (k * length)
+            y0 = oy + uy * (k * length)
+            x1, y1 = x0 + ux * length, y0 + uy * length
+            poly = Polygon([
+                (x0, y0), (x1, y1),
+                (x1 + nx * depth, y1 + ny * depth),
+                (x0 + nx * depth, y0 + ny * depth),
+            ])
+            k += 1
+            if not prepared.contains(poly):
+                continue
+            if not occupied.is_empty and poly.intersects(occupied.buffer(clear)):
+                continue
+            out.append(list(poly.exterior.coords)[:-1])
+            occupied = unary_union([occupied, poly])
+    return out
 
 
 # ---------------------------------------------------------------------------
 #  Zápis stání do DXF
 # ---------------------------------------------------------------------------
-def add_stalls_to_doc(doc, stalls):
-    if STALL_LAYER not in doc.layers:
-        doc.layers.add(STALL_LAYER, color=STALL_LAYER_COLOR)
+def add_stalls_to_doc(doc, groups):
+    """
+    Zapíše stání do DXF. `groups` = seznam (layer, color, stalls).
+    Před zápisem smaže všechna dříve vygenerovaná stání (idempotence).
+    """
     msp = doc.modelspace()
-    for pts in stalls:
-        msp.add_lwpolyline(
-            pts, format="xy", close=True,
-            dxfattribs={"layer": STALL_LAYER},
-        )
+    for lyr in ALL_STALL_LAYERS:
+        for e in list(msp.query(f'LWPOLYLINE[layer=="{lyr}"]')):
+            msp.delete_entity(e)
+    for layer, color, stalls in groups:
+        if layer not in doc.layers:
+            doc.layers.add(layer, color=color)
+        for pts in stalls:
+            msp.add_lwpolyline(
+                pts, format="xy", close=True, dxfattribs={"layer": layer},
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -332,18 +405,19 @@ def generate():
     except ValueError:
         return jsonify({"error": "Neplatná číselná hodnota parametru."}), 400
 
-    typ = request.form.get("type", "kolme").lower()        # kolme|sikme*|podelne
-    layer = request.form.get("layer") or None              # volitelná vrstva obrysu
+    typ = request.form.get("type", "kolme").lower()    # kolme|sikme*|podelne|kombi
+    layer = request.form.get("layer") or None          # volitelná vrstva obrysu
     parallel = (typ == "podelne")
-    if typ == "kolme":
-        angle = 90.0
+    kombi = (typ == "kombi")
+    if typ in ("kolme", "kombi"):
+        angle = 90.0  # kombi = kolmé jádro + podélné okraje
 
     # Mapování ČSN šířka/délka -> rozteč podél komunikace (pitch) a kolmá hloubka (depth)
     if parallel:
         # podélné: délka jede podél komunikace, šířka je kolmá hloubka
         pitch, depth = length, width
     else:
-        # kolmé/šikmé: šířka = rozteč podél komunikace, délka = kolmá hloubka
+        # kolmé/šikmé/kombi(jádro): šířka = rozteč podél komunikace, délka = kolmá hloubka
         pitch, depth = width, length
 
     # Načtení DXF přes dočasný soubor (kvůli detekci kódování)
@@ -370,8 +444,25 @@ def generate():
                 "diagnostics": diag,
             }), 422
 
-        stalls = generate_stalls(boundary, pitch, depth, aisle, angle, parallel)
-        add_stalls_to_doc(doc, stalls)
+        if kombi:
+            # kolmé jádro
+            core = generate_stalls(boundary, pitch, depth, aisle, 90.0, False)
+            field = unary_union([Polygon(p) for p in core]) if core else Polygon()
+            # podélné podél volných hran (ČSN: šířka 2,0 / délka 5,75 m)
+            p_pre = CSN_PRESETS["podelne"]
+            edges = parallel_along_edges(boundary, field,
+                                         length=p_pre["length"], depth=p_pre["width"])
+            add_stalls_to_doc(doc, [
+                (KOLME_LAYER, STALL_LAYER_COLOR, core),
+                (PODELNE_LAYER, 30, edges),  # 30 = oranžová (ACI)
+            ])
+            total = len(core) + len(edges)
+            counts = f"{len(core)}+{len(edges)}"
+        else:
+            stalls = generate_stalls(boundary, pitch, depth, aisle, angle, parallel)
+            add_stalls_to_doc(doc, [(STALL_LAYER, STALL_LAYER_COLOR, stalls)])
+            total = len(stalls)
+            counts = str(total)
 
         # Uložení výstupu do paměti
         text_stream = io.StringIO()
@@ -387,10 +478,13 @@ def generate():
             download_name=f"{base}_stani.dxf",
         )
         # Počet stání předáme v hlavičce (frontend ji může přečíst)
-        resp.headers["X-Stall-Count"] = str(len(stalls))
+        resp.headers["X-Stall-Count"] = str(total)
+        resp.headers["X-Stall-Breakdown"] = counts
         if diag.get("auto_closed"):
             resp.headers["X-Warning"] = "boundary-auto-closed"
-        resp.headers["Access-Control-Expose-Headers"] = "X-Stall-Count, X-Warning"
+        resp.headers["Access-Control-Expose-Headers"] = (
+            "X-Stall-Count, X-Stall-Breakdown, X-Warning"
+        )
         return resp
     finally:
         try:
