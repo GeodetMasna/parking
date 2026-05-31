@@ -1,0 +1,232 @@
+<!DOCTYPE html>
+<html lang="cs">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Parkoviště z mapy · ČSN 73 6056</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+<link rel="stylesheet" href="https://unpkg.com/@geoman-io/leaflet-geoman-free@2.18.3/dist/leaflet-geoman.css">
+<link rel="stylesheet" href="https://unpkg.com/leaflet-control-geocoder/dist/Control.Geocoder.css">
+<link href="https://fonts.googleapis.com/css2?family=Spline+Sans+Mono:wght@400;500;600&family=Hanken+Grotesk:wght@400;500;700&display=swap" rel="stylesheet">
+<style>
+  :root{
+    --bg:#0b1220; --panel:#101a2ef2; --line:#1f3050; --ink:#e8eefc;
+    --muted:#7d8db3; --muted-2:#5b6b91; --accent:#3ddc97; --accent-dim:#1f8d63;
+    --orange:#ffb347; --danger:#ff6b6b;
+    --mono:'Spline Sans Mono',ui-monospace,monospace; --sans:'Hanken Grotesk',system-ui,sans-serif;
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  html,body{height:100%}
+  body{font-family:var(--sans); color:var(--ink); background:var(--bg)}
+  #map{position:absolute; inset:0; z-index:1}
+
+  .panel{position:absolute; z-index:1000; top:14px; left:14px; width:310px;
+    max-width:calc(100vw - 28px); background:var(--panel); backdrop-filter:blur(8px);
+    border:1px solid var(--line); border-radius:13px; padding:16px;
+    box-shadow:0 18px 50px -24px #000; max-height:calc(100vh - 28px); overflow:auto}
+  .tag{font-family:var(--mono); font-size:10px; letter-spacing:.2em; text-transform:uppercase;
+    color:var(--accent); border:1px solid var(--accent-dim); border-radius:3px; padding:3px 7px}
+  h1{font-size:19px; font-weight:700; margin:11px 0 3px; letter-spacing:-.01em}
+  .sub{color:var(--muted); font-size:12px; line-height:1.45; margin-bottom:14px}
+
+  .draw-row{display:grid; grid-template-columns:1fr 1fr; gap:8px; margin-bottom:8px}
+  .dbtn{padding:10px 8px; border:1px solid var(--line); border-radius:8px; background:#0d1626;
+    color:var(--ink); font-family:var(--mono); font-size:12px; cursor:pointer; transition:.13s}
+  .dbtn:hover{border-color:var(--accent)}
+  .dbtn.active{border-color:var(--accent); background:rgba(61,220,151,.12); color:var(--accent)}
+  .dbtn.road.active{border-color:var(--orange); background:rgba(255,179,71,.14); color:var(--orange)}
+  .clear{width:100%; padding:8px; border:1px solid var(--line); border-radius:8px; background:transparent;
+    color:var(--muted); font-family:var(--mono); font-size:11px; cursor:pointer; margin-bottom:14px}
+  .clear:hover{border-color:var(--danger); color:var(--danger)}
+
+  label{display:block; font-family:var(--mono); font-size:10px; letter-spacing:.12em;
+    text-transform:uppercase; color:var(--muted); margin:0 0 6px}
+  select,input[type=number]{width:100%; background:var(--bg); border:1px solid var(--line);
+    border-radius:7px; padding:9px 10px; color:var(--ink); font-family:var(--mono); font-size:13px}
+  select:focus,input:focus{outline:none; border-color:var(--accent)}
+  .grid2{display:grid; grid-template-columns:1fr 1fr; gap:9px; margin-bottom:11px}
+  .field{margin-bottom:11px}
+  .unit{position:relative}
+  .unit .u{position:absolute; right:10px; top:50%; transform:translateY(-50%);
+    color:var(--muted-2); font-family:var(--mono); font-size:11px}
+
+  .go{width:100%; padding:13px; border:none; border-radius:9px; background:var(--accent);
+    color:#06281a; font-family:var(--mono); font-weight:600; font-size:13px; letter-spacing:.04em;
+    text-transform:uppercase; cursor:pointer; transition:.13s; margin-top:4px}
+  .go:hover:not(:disabled){background:#52e8a8}
+  .go:disabled{opacity:.5; cursor:not-allowed}
+  .dl{display:none; width:100%; padding:11px; border:1px solid var(--accent-dim); border-radius:9px;
+    background:transparent; color:var(--accent); font-family:var(--mono); font-size:12px;
+    cursor:pointer; margin-top:8px}
+  .status{margin-top:11px; font-family:var(--mono); font-size:12px; line-height:1.45; min-height:16px}
+  .status.ok{color:var(--accent)} .status.err{color:var(--danger)} .status.work{color:var(--muted)}
+  .hint{font-family:var(--mono); font-size:10.5px; color:var(--muted-2); line-height:1.5; margin-top:11px}
+  .leaflet-container{background:#0b1220}
+</style>
+</head>
+<body>
+<div id="map"></div>
+
+<div class="panel">
+  <span class="tag">ČSN 73 6056 · S-JTSK</span>
+  <h1>Parkoviště z mapy</h1>
+  <p class="sub">Najdi lokalitu, nakresli obrys plochy a příjezdové komunikace nad ortofotem ČÚZK. Výstup je georeferencovaný DXF v S-JTSK.</p>
+
+  <div class="draw-row">
+    <button class="dbtn" id="bBoundary">⬡ Obrys plochy</button>
+    <button class="dbtn road" id="bRoad">╱ Komunikace</button>
+  </div>
+  <button class="clear" id="bClear">Vymazat vše</button>
+
+  <div class="field">
+    <label>Typ řazení</label>
+    <select id="type">
+      <option value="kolme"   data-w="2.50" data-l="5.00" data-a="6.00" data-ang="90">Kolmé · 90°</option>
+      <option value="kombi"   data-w="2.50" data-l="5.00" data-a="6.00" data-ang="90">Kombinované (kolmé + podélné okraje)</option>
+      <option value="sikme75" data-w="2.60" data-l="5.30" data-a="5.00" data-ang="75">Šikmé · 75°</option>
+      <option value="sikme60" data-w="2.90" data-l="5.20" data-a="3.50" data-ang="60">Šikmé · 60°</option>
+      <option value="sikme45" data-w="3.55" data-l="4.80" data-a="3.00" data-ang="45">Šikmé · 45°</option>
+      <option value="podelne" data-w="2.00" data-l="5.75" data-a="3.50" data-ang="0">Podélné · 0°</option>
+    </select>
+  </div>
+  <div class="grid2">
+    <div><label>Šířka stání</label><div class="unit"><input type="number" id="width" step="0.05" value="2.50"><span class="u">m</span></div></div>
+    <div><label>Délka stání</label><div class="unit"><input type="number" id="length" step="0.05" value="5.00"><span class="u">m</span></div></div>
+  </div>
+  <div class="grid2">
+    <div><label>Š. komunikace</label><div class="unit"><input type="number" id="aisle" step="0.1" value="6.00"><span class="u">m</span></div></div>
+    <div><label>Úhel</label><div class="unit"><input type="number" id="angle" step="1" value="90"><span class="u">°</span></div></div>
+  </div>
+
+  <button class="go" id="bGo">Vygenerovat stání</button>
+  <button class="dl" id="bDl">⬇ Stáhnout DXF (S-JTSK)</button>
+  <div class="status" id="status"></div>
+  <div class="hint">Ortofoto © ČÚZK. Přesnost ~0,5 m — pro studii; realizaci ověř zaměřením. Komunikace jsou zatím jen referenční vrstva.</div>
+</div>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script src="https://unpkg.com/@geoman-io/leaflet-geoman-free@2.18.3/dist/leaflet-geoman.min.js"></script>
+<script src="https://unpkg.com/leaflet-control-geocoder/dist/Control.Geocoder.js"></script>
+<script>
+// ===========================================================================
+const BACKEND_URL = "https://web-production-73564.up.railway.app";
+// ===========================================================================
+const $ = (id) => document.getElementById(id);
+
+// --- Mapa + ortofoto ČÚZK --------------------------------------------------
+const map = L.map("map", { zoomControl:true }).setView([49.80, 15.50], 8);
+
+const orto = L.tileLayer.wms(
+  "https://ags.cuzk.gov.cz/arcgis1/services/ORTOFOTO/MapServer/WMSServer",
+  { layers:"0", format:"image/png", version:"1.3.0", maxZoom:23, attribution:"Ortofoto © ČÚZK" }
+).addTo(map);
+const osm = L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png",
+  { maxZoom:19, attribution:"© OpenStreetMap" });
+L.control.layers({ "Ortofoto ČÚZK":orto, "OpenStreetMap":osm }, null, {position:"bottomright"}).addTo(map);
+
+L.Control.geocoder({ defaultMarkGeocode:true, placeholder:"Hledat adresu…" }).addTo(map);
+
+// --- Kreslení obrysu a komunikací -----------------------------------------
+let boundaryLayer = null;     // jediný obrys (polygon)
+let roadLayers = [];          // komunikace (polylinie)
+let resultLayer = null;       // vygenerovaná stání
+
+function setMode(mode){
+  $("bBoundary").classList.toggle("active", mode==="boundary");
+  $("bRoad").classList.toggle("active", mode==="road");
+  map.pm.disableDraw();
+  if (mode==="boundary") map.pm.enableDraw("Polygon", { finishOn:"dblclick" });
+  if (mode==="road")     map.pm.enableDraw("Line",    { finishOn:"dblclick" });
+}
+$("bBoundary").onclick = () => setMode($("bBoundary").classList.contains("active") ? null : "boundary");
+$("bRoad").onclick     = () => setMode($("bRoad").classList.contains("active") ? null : "road");
+
+map.on("pm:create", (e) => {
+  const l = e.layer;
+  if (e.shape === "Polygon"){
+    if (boundaryLayer) map.removeLayer(boundaryLayer);
+    boundaryLayer = l;
+    l.setStyle({ color:"#3ddc97", fillColor:"#3ddc97", fillOpacity:.12, weight:2 });
+  } else if (e.shape === "Line"){
+    roadLayers.push(l);
+    l.setStyle({ color:"#ffb347", weight:4 });
+  }
+  setMode(null);
+  info();
+});
+$("bClear").onclick = () => {
+  if (boundaryLayer) map.removeLayer(boundaryLayer); boundaryLayer = null;
+  roadLayers.forEach(l => map.removeLayer(l)); roadLayers = [];
+  if (resultLayer) map.removeLayer(resultLayer); resultLayer = null;
+  $("bDl").style.display = "none"; setStatus("", ""); info();
+};
+function info(){
+  if (!boundaryLayer && !roadLayers.length){ setStatus("", "Nakresli obrys plochy."); return; }
+  setStatus("", `Obrys: ${boundaryLayer?"ano":"ne"} · komunikace: ${roadLayers.length}`);
+}
+
+// --- Parametry podle typu --------------------------------------------------
+$("type").addEventListener("change", e => {
+  const o = e.target.selectedOptions[0];
+  $("width").value=o.dataset.w; $("length").value=o.dataset.l;
+  $("aisle").value=o.dataset.a; $("angle").value=o.dataset.ang;
+});
+
+// --- Pomocné: latlngs -> [[lng,lat],...] -----------------------------------
+const ring = (latlngs) => latlngs.map(p => [p.lng, p.lat]);
+
+// --- Generování ------------------------------------------------------------
+let lastDxf = null;
+$("bGo").onclick = async () => {
+  if (!boundaryLayer){ setStatus("err", "Nejprve nakresli obrys plochy."); return; }
+  const poly = boundaryLayer.getLatLngs()[0];
+  const payload = {
+    boundary: ring(poly),
+    roads: roadLayers.map(l => ring(l.getLatLngs())),
+    type: $("type").value,
+    width: parseFloat($("width").value), length: parseFloat($("length").value),
+    aisle: parseFloat($("aisle").value), angle: parseFloat($("angle").value),
+  };
+  $("bGo").disabled = true; $("bDl").style.display = "none";
+  setStatus("work", "Generuji stání…");
+  try {
+    const res = await fetch(BACKEND_URL + "/generate-geo", {
+      method:"POST", headers:{ "Content-Type":"application/json" }, body:JSON.stringify(payload),
+    });
+    if (!res.ok){
+      let m = "Chyba ("+res.status+")"; try{ const j=await res.json(); if(j.error)m=j.error; }catch(_){}
+      setStatus("err", "✕ "+m); return;
+    }
+    const j = await res.json();
+    if (resultLayer) map.removeLayer(resultLayer);
+    resultLayer = L.geoJSON(j.stalls, { style: f => {
+      const orange = f.properties.layer === "PARKING_PODELNE";
+      return { color: orange?"#cc7a00":"#1f8d63", fillColor: orange?"#ffb347":"#3ddc97",
+               fillOpacity:.7, weight:1 };
+    }}).addTo(map);
+    lastDxf = j.dxf_base64;
+    $("bDl").style.display = "block";
+    let msg = "✓ "+j.count+" stání";
+    if ($("type").value==="kombi" && j.breakdown.includes("+")){
+      const [k,p]=j.breakdown.split("+"); msg += ` (${k} kolmých + ${p} podélných)`;
+    }
+    setStatus("ok", msg + ". Náhled je na mapě.");
+  } catch(err){
+    setStatus("err", "✕ Nelze se spojit s backendem ("+BACKEND_URL+").");
+  } finally { $("bGo").disabled = false; }
+};
+
+$("bDl").onclick = () => {
+  if (!lastDxf) return;
+  const bytes = Uint8Array.from(atob(lastDxf), c => c.charCodeAt(0));
+  const url = URL.createObjectURL(new Blob([bytes], { type:"application/dxf" }));
+  const a = document.createElement("a");
+  a.href = url; a.download = "parkoviste_sjtsk.dxf";
+  document.body.appendChild(a); a.click(); a.remove(); URL.revokeObjectURL(url);
+};
+
+function setStatus(cls, txt){ const s=$("status"); s.className="status "+cls; s.textContent=txt; }
+info();
+</script>
+</body>
+</html>
