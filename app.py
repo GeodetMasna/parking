@@ -14,7 +14,9 @@ Spuštění lokálně:  python app.py
 Spuštění produkce:  gunicorn app:app --bind 0.0.0.0:$PORT
 """
 
+import base64
 import io
+import json
 import math
 import os
 import tempfile
@@ -28,6 +30,7 @@ from shapely.affinity import rotate as shp_rotate
 from shapely.geometry import Polygon, Point
 from shapely.ops import unary_union
 from shapely.prepared import prep
+from pyproj import Transformer
 
 app = Flask(__name__)
 
@@ -168,6 +171,76 @@ def extract_boundary(doc, layer=None):
         diag["auto_closed"] = True
         return open_polys[0], diag
     return None, diag
+
+
+def list_closed_curves(doc, layer=None):
+    """
+    Vrátí VŠECHNY uzavřené křivky jako kandidáty pro výběr ve frontendu:
+    [{id(handle), layer, area, points:[[x,y],…]}], seřazené od největší plochy.
+    """
+    out = []
+    for e in _iter_entities(doc):
+        ent_layer = getattr(e.dxf, "layer", None)
+        if ent_layer in ALL_STALL_LAYERS:
+            continue
+        if layer and ent_layer != layer:
+            continue
+        res = _points_from_entity(e)
+        if not res:
+            continue
+        pts, is_closed = res
+        if len(pts) < 3 or not (is_closed or _is_geom_closed(pts)):
+            continue
+        try:
+            poly = Polygon(pts)
+            if not poly.is_valid:
+                poly = poly.buffer(0)
+        except Exception:
+            continue
+        if poly.is_empty or poly.area <= 0:
+            continue
+        if poly.geom_type == "MultiPolygon":
+            poly = max(poly.geoms, key=lambda g: g.area)
+        ext = [[round(x, 4), round(y, 4)] for x, y in list(poly.exterior.coords)[:-1]]
+        out.append({
+            "id": getattr(e.dxf, "handle", None) or str(len(out)),
+            "layer": ent_layer or "0",
+            "area": round(poly.area, 2),
+            "points": ext,
+        })
+    out.sort(key=lambda c: c["area"], reverse=True)
+    return out
+
+
+def _polygon_from_selection(selected_pointsets):
+    """
+    Z vybraných křivek sestaví obrys: největší = vnější hranice, menší ležící
+    uvnitř = díry (překážky/ostrůvky, které se vynechají). Vrací Polygon | None.
+    """
+    polys = []
+    for pts in selected_pointsets:
+        if not pts or len(pts) < 3:
+            continue
+        try:
+            p = Polygon(pts)
+            if not p.is_valid:
+                p = p.buffer(0)
+        except Exception:
+            continue
+        if not p.is_empty and p.area > 0:
+            polys.append(p)
+    if not polys:
+        return None
+    polys.sort(key=lambda p: p.area, reverse=True)
+    outer = polys[0]
+    holes = [list(p.exterior.coords) for p in polys[1:]
+             if outer.contains(p.buffer(-1e-6))]
+    result = Polygon(list(outer.exterior.coords), holes)
+    if not result.is_valid:
+        result = result.buffer(0)
+    if result.geom_type == "MultiPolygon":
+        result = max(result.geoms, key=lambda g: g.area)
+    return result if not result.is_empty else None
 
 
 # ---------------------------------------------------------------------------
@@ -345,6 +418,44 @@ def add_stalls_to_doc(doc, groups):
 
 
 # ---------------------------------------------------------------------------
+#  Sdílené pomocné funkce pro generování
+# ---------------------------------------------------------------------------
+# Transformace WGS-84 (EPSG:4326) <-> S-JTSK / Křovák EAST-NORTH (EPSG:5514)
+_TO_JTSK = Transformer.from_crs(4326, 5514, always_xy=True)
+_TO_WGS = Transformer.from_crs(5514, 4326, always_xy=True)
+
+
+def map_params(typ, width, length, angle):
+    """Z typu řazení a ČSN rozměrů odvodí rozteč/hloubku a režim."""
+    parallel = (typ == "podelne")
+    kombi = (typ == "kombi")
+    if typ in ("kolme", "kombi"):
+        angle = 90.0
+    if parallel:
+        pitch, depth = length, width      # podélné: délka podél komunikace
+    else:
+        pitch, depth = width, length      # kolmé/šikmé: šířka = rozteč
+    return pitch, depth, angle, parallel, kombi
+
+
+def build_groups(boundary, pitch, depth, aisle, angle, parallel, kombi):
+    """
+    Vygeneruje stání a vrátí (groups, total, breakdown).
+    groups = seznam (layer, color, stalls) pro zápis do DXF.
+    """
+    if kombi:
+        core = generate_stalls(boundary, pitch, depth, aisle, 90.0, False)
+        field = unary_union([Polygon(p) for p in core]) if core else Polygon()
+        pp = CSN_PRESETS["podelne"]
+        edges = parallel_along_edges(boundary, field,
+                                     length=pp["length"], depth=pp["width"])
+        groups = [(KOLME_LAYER, STALL_LAYER_COLOR, core), (PODELNE_LAYER, 30, edges)]
+        return groups, len(core) + len(edges), f"{len(core)}+{len(edges)}"
+    stalls = generate_stalls(boundary, pitch, depth, aisle, angle, parallel)
+    return [(STALL_LAYER, STALL_LAYER_COLOR, stalls)], len(stalls), str(len(stalls))
+
+
+# ---------------------------------------------------------------------------
 #  Endpointy
 # ---------------------------------------------------------------------------
 @app.get("/")
@@ -385,6 +496,28 @@ def inspect():
             pass
 
 
+@app.post("/curves")
+def curves():
+    """Vrátí všechny uzavřené křivky v DXF (pro výběr obrysu ve frontendu)."""
+    if "file" not in request.files or not request.files["file"].filename:
+        return jsonify({"error": "Chybí soubor DXF (pole 'file')."}), 400
+    upload = request.files["file"]
+    tmp = tempfile.NamedTemporaryFile(suffix=".dxf", delete=False)
+    try:
+        upload.save(tmp.name)
+        tmp.close()
+        try:
+            doc = ezdxf.readfile(tmp.name)
+        except (IOError, ezdxf.DXFStructureError) as exc:
+            return jsonify({"error": f"Neplatný DXF: {exc}"}), 400
+        return jsonify({"curves": list_closed_curves(doc, request.form.get("layer") or None)})
+    finally:
+        try:
+            os.unlink(tmp.name)
+        except OSError:
+            pass
+
+
 @app.post("/generate")
 def generate():
     if "file" not in request.files:
@@ -407,18 +540,7 @@ def generate():
 
     typ = request.form.get("type", "kolme").lower()    # kolme|sikme*|podelne|kombi
     layer = request.form.get("layer") or None          # volitelná vrstva obrysu
-    parallel = (typ == "podelne")
-    kombi = (typ == "kombi")
-    if typ in ("kolme", "kombi"):
-        angle = 90.0  # kombi = kolmé jádro + podélné okraje
-
-    # Mapování ČSN šířka/délka -> rozteč podél komunikace (pitch) a kolmá hloubka (depth)
-    if parallel:
-        # podélné: délka jede podél komunikace, šířka je kolmá hloubka
-        pitch, depth = length, width
-    else:
-        # kolmé/šikmé/kombi(jádro): šířka = rozteč podél komunikace, délka = kolmá hloubka
-        pitch, depth = width, length
+    pitch, depth, angle, parallel, kombi = map_params(typ, width, length, angle)
 
     # Načtení DXF přes dočasný soubor (kvůli detekci kódování)
     tmp_in = tempfile.NamedTemporaryFile(suffix=".dxf", delete=False)
@@ -430,7 +552,20 @@ def generate():
         except (IOError, ezdxf.DXFStructureError) as exc:
             return jsonify({"error": f"Neplatný DXF: {exc}"}), 400
 
-        boundary, diag = extract_boundary(doc, layer)
+        # Obrys: buď vybraný ve frontendu (pole 'selected' = JSON křivek),
+        # jinak automaticky největší uzavřená křivka.
+        selected_raw = request.form.get("selected")
+        boundary = None
+        diag = {"types": {}, "auto_closed": False, "selected": False}
+        if selected_raw:
+            try:
+                boundary = _polygon_from_selection(json.loads(selected_raw))
+                diag["selected"] = True
+            except (ValueError, TypeError):
+                boundary = None
+
+        if boundary is None:
+            boundary, diag = extract_boundary(doc, layer)
         if boundary is None:
             found = ", ".join(f"{k}×{v}" for k, v in sorted(diag["types"].items())) or "nic"
             return jsonify({
@@ -444,25 +579,9 @@ def generate():
                 "diagnostics": diag,
             }), 422
 
-        if kombi:
-            # kolmé jádro
-            core = generate_stalls(boundary, pitch, depth, aisle, 90.0, False)
-            field = unary_union([Polygon(p) for p in core]) if core else Polygon()
-            # podélné podél volných hran (ČSN: šířka 2,0 / délka 5,75 m)
-            p_pre = CSN_PRESETS["podelne"]
-            edges = parallel_along_edges(boundary, field,
-                                         length=p_pre["length"], depth=p_pre["width"])
-            add_stalls_to_doc(doc, [
-                (KOLME_LAYER, STALL_LAYER_COLOR, core),
-                (PODELNE_LAYER, 30, edges),  # 30 = oranžová (ACI)
-            ])
-            total = len(core) + len(edges)
-            counts = f"{len(core)}+{len(edges)}"
-        else:
-            stalls = generate_stalls(boundary, pitch, depth, aisle, angle, parallel)
-            add_stalls_to_doc(doc, [(STALL_LAYER, STALL_LAYER_COLOR, stalls)])
-            total = len(stalls)
-            counts = str(total)
+        groups, total, counts = build_groups(boundary, pitch, depth, aisle,
+                                              angle, parallel, kombi)
+        add_stalls_to_doc(doc, groups)
 
         # Uložení výstupu do paměti
         text_stream = io.StringIO()
@@ -491,6 +610,83 @@ def generate():
             os.unlink(tmp_in.name)
         except OSError:
             pass
+
+
+@app.post("/generate-geo")
+def generate_geo():
+    """
+    Vstup z mapy (GeoJSON ve WGS-84). Transformuje obrys i komunikace do S-JTSK,
+    vygeneruje stání a vrátí JSON:
+      { count, breakdown, stalls (GeoJSON WGS-84 pro náhled), dxf_base64 }.
+    Fáze 1: komunikace = jen referenční vrstva v DXF (zatím neovlivní rozmístění).
+    """
+    data = request.get_json(silent=True) or {}
+    boundary_ll = data.get("boundary")
+    roads_ll = data.get("roads", []) or []
+    if not boundary_ll or len(boundary_ll) < 3:
+        return jsonify({"error": "Chybí obrys plochy (min. 3 body)."}), 400
+    try:
+        width = float(data.get("width", 2.5))
+        length = float(data.get("length", 5.0))
+        aisle = float(data.get("aisle", 6.0))
+        angle = float(data.get("angle", 90.0))
+    except (TypeError, ValueError):
+        return jsonify({"error": "Neplatná číselná hodnota parametru."}), 400
+
+    typ = str(data.get("type", "kolme")).lower()
+    pitch, depth, angle, parallel, kombi = map_params(typ, width, length, angle)
+
+    def to_jtsk(ring):
+        return [_TO_JTSK.transform(lon, lat) for lon, lat in ring]
+
+    boundary_xy = to_jtsk(boundary_ll)
+    try:
+        boundary = Polygon(boundary_xy)
+        if not boundary.is_valid:
+            boundary = boundary.buffer(0)
+    except Exception:
+        boundary = None
+    if boundary is None or boundary.is_empty or boundary.area <= 0:
+        return jsonify({"error": "Obrys nelze zpracovat."}), 422
+    roads_xy = [to_jtsk(r) for r in roads_ll if r and len(r) >= 2]
+
+    groups, total, counts = build_groups(boundary, pitch, depth, aisle,
+                                         angle, parallel, kombi)
+
+    # Nový DXF georeferencovaný v S-JTSK (jednotky = metry)
+    doc = ezdxf.new()
+    doc.header["$INSUNITS"] = 6
+    msp = doc.modelspace()
+    doc.layers.add("OBRYS", color=7)
+    msp.add_lwpolyline(boundary_xy, close=True, dxfattribs={"layer": "OBRYS"})
+    if roads_xy:
+        doc.layers.add("KOMUNIKACE", color=1)
+        for r in roads_xy:
+            msp.add_lwpolyline(r, dxfattribs={"layer": "KOMUNIKACE"})
+    add_stalls_to_doc(doc, groups)
+
+    text = io.StringIO()
+    doc.write(text)
+    dxf_b64 = base64.b64encode(text.getvalue().encode("utf-8")).decode("ascii")
+
+    # Stání zpět do WGS-84 pro náhled na mapě
+    features = []
+    for layer, color, stalls in groups:
+        for pts in stalls:
+            ring = [list(_TO_WGS.transform(x, y)) for x, y in pts]
+            ring.append(ring[0])
+            features.append({
+                "type": "Feature",
+                "properties": {"layer": layer},
+                "geometry": {"type": "Polygon", "coordinates": [ring]},
+            })
+
+    return jsonify({
+        "count": total,
+        "breakdown": counts,
+        "stalls": {"type": "FeatureCollection", "features": features},
+        "dxf_base64": dxf_b64,
+    })
 
 
 if __name__ == "__main__":
